@@ -25,7 +25,7 @@ import yt_dlp
 # ─────────────────────────────────────────
 #  CONFIG  ←  Edit these before running
 # ─────────────────────────────────────────
-BOT_TOKEN      = "YOUR_BOT_TOKEN_HERE"          # From @BotFather
+BOT_TOKEN      = "8352705831:AAH7auZWJWENgCIEtEVzGSiAcrK4ILFmwwU"          # From @BotFather
 FORCE_CHANNEL  = "@your_channel_username"        # e.g. "@mychannel"
 DAILY_LIMIT    = 10                              # Max downloads per user/day
 DOWNLOAD_DIR   = "downloads"                     # Temp folder for media
