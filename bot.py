@@ -198,111 +198,248 @@ async def check_fsub(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
 
 
 # ══════════════════════════════════════════
-#  DOWNLOADER
+#  DOWNLOADER  — yt-dlp + Invidious fallback
 # ══════════════════════════════════════════
 
-def _base_opts(skip_download: bool = False) -> dict:
-    """
-    Best cookieless bypass for YouTube on VPS (2025).
+import re as _re
+import urllib.request as _req
+import json as _json
+import subprocess
 
-    tv_embedded + android_vr = no PO Token required on any server IP.
-    These clients are for embedded/VR playback — YouTube doesn't
-    enforce bot-checks on them yet.
-    """
+# Public Invidious instances — tried in order if yt-dlp fails
+INVIDIOUS_INSTANCES = [
+    "https://inv.nadeko.net",
+    "https://invidious.nerdvpn.de",
+    "https://invidious.privacyredirect.com",
+    "https://iv.datura.network",
+]
+
+QUALITY_HEIGHT = {"360": 360, "480": 480, "720": 720, "1080": 1080}
+
+
+def _extract_video_id(url: str) -> str | None:
+    """Pull YouTube video ID from any YouTube URL format."""
+    patterns = [
+        r"(?:v=|youtu\.be/|shorts/|embed/)([a-zA-Z0-9_-]{11})",
+    ]
+    for p in patterns:
+        m = _re.search(p, url)
+        if m:
+            return m.group(1)
+    return None
+
+
+# ── Strategy 1: yt-dlp ──────────────────────────────────────────
+
+def _ytdlp_opts(extra: dict = {}) -> dict:
     opts = {
-        "quiet": False,         # Show errors in server log for debugging
-        "no_warnings": False,
-        "retries": 10,
-        "socket_timeout": 30,
+        "quiet": True,
+        "no_warnings": True,
+        "retries": 5,
         "nocheckcertificate": True,
         "extractor_args": {
             "youtube": {
-                # tv_embedded and android_vr bypass PO Token on VPS
                 "player_client": ["tv_embedded", "android_vr", "android", "ios"],
                 "skip": ["translated_subs"],
             }
         },
         "http_headers": {
             "User-Agent": "com.google.android.youtube/19.09.37 (Linux; U; Android 11)",
-            "Accept-Language": "en-US,en;q=0.9",
         },
     }
-    if skip_download:
-        opts["skip_download"] = True
     if os.path.exists(COOKIES_FILE):
         opts["cookiefile"] = COOKIES_FILE
+    opts.update(extra)
     return opts
 
 
-def _build_ydl_opts(quality: str, out_template: str) -> dict:
-    """Build yt-dlp options based on quality choice."""
-    base = _base_opts()
-    base["outtmpl"] = out_template
+def _ytdlp_info(url: str) -> dict | None:
+    try:
+        opts = _ytdlp_opts({"skip_download": True})
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            return ydl.extract_info(url, download=False)
+    except Exception as e:
+        logger.warning(f"yt-dlp info failed: {e}")
+        return None
+
+
+def _ytdlp_download(url: str, quality: str) -> str | None:
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    template = f"{DOWNLOAD_DIR}/%(id)s_{quality}.%(ext)s"
+
+    fmt = "bestaudio/best"
+    post = []
+    merge = None
 
     if quality == "audio":
-        base.update({
-            "format": "bestaudio/best",
-            "postprocessors": [{
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "192",
-            }],
-        })
-    elif quality == "360":
-        base["format"] = (
-            "bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/"
-            "best[height<=360][ext=mp4]/best[height<=360]"
-        )
-        base["merge_output_format"] = "mp4"
-    elif quality == "480":
-        base["format"] = (
-            "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/"
-            "best[height<=480][ext=mp4]/best[height<=480]"
-        )
-        base["merge_output_format"] = "mp4"
-    elif quality == "720":
-        base["format"] = (
-            "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/"
-            "best[height<=720][ext=mp4]/best[height<=720]"
-        )
-        base["merge_output_format"] = "mp4"
-    elif quality == "1080":
-        base["format"] = (
-            "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/"
-            "best[height<=1080][ext=mp4]/best[height<=1080]"
-        )
-        base["merge_output_format"] = "mp4"
+        post = [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}]
+    else:
+        h = QUALITY_HEIGHT.get(quality, 360)
+        fmt   = (f"bestvideo[height<={h}][ext=mp4]+bestaudio[ext=m4a]/"
+                 f"best[height<={h}][ext=mp4]/best[height<={h}]")
+        merge = "mp4"
 
-    return base
+    extra = {"outtmpl": template, "format": fmt}
+    if post:  extra["postprocessors"]    = post
+    if merge: extra["merge_output_format"] = merge
 
+    try:
+        opts = _ytdlp_opts(extra)
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info     = ydl.extract_info(url, download=True)
+            filename = ydl.prepare_filename(info)
+            base     = os.path.splitext(filename)[0]
+            for ext in (".mp4", ".mp3", ".webm", ".mkv", ".m4a"):
+                c = base + ext
+                if os.path.exists(c):
+                    return c
+            if os.path.exists(filename):
+                return filename
+    except Exception as e:
+        logger.warning(f"yt-dlp download failed: {e}")
+    return None
+
+
+# ── Strategy 2: Invidious API ───────────────────────────────────
+
+def _invidious_info(video_id: str) -> dict | None:
+    """Fetch video metadata from Invidious API."""
+    fields = "title,lengthSeconds,viewCount,formatStreams,adaptiveFormats,author"
+    for instance in INVIDIOUS_INSTANCES:
+        try:
+            api_url = f"{instance}/api/v1/videos/{video_id}?fields={fields}"
+            req     = _req.Request(api_url, headers={"User-Agent": "Mozilla/5.0"})
+            with _req.urlopen(req, timeout=10) as r:
+                return _json.loads(r.read().decode())
+        except Exception as e:
+            logger.warning(f"Invidious {instance} failed: {e}")
+    return None
+
+
+def _invidious_download(video_id: str, quality: str) -> str | None:
+    """Download via Invidious stream URL."""
+    data = _invidious_info(video_id)
+    if not data:
+        return None
+
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    out_path = f"{DOWNLOAD_DIR}/{video_id}_{quality}"
+
+    if quality == "audio":
+        # Get best audio stream
+        audio_streams = [
+            f for f in data.get("adaptiveFormats", [])
+            if f.get("type", "").startswith("audio/mp4")
+        ]
+        if not audio_streams:
+            audio_streams = [
+                f for f in data.get("adaptiveFormats", [])
+                if "audio" in f.get("type", "")
+            ]
+        if not audio_streams:
+            return None
+
+        audio_streams.sort(key=lambda x: int(x.get("bitrate", 0)), reverse=True)
+        stream_url = audio_streams[0]["url"]
+        raw_path   = out_path + ".m4a"
+        mp3_path   = out_path + ".mp3"
+
+        _download_url(stream_url, raw_path)
+        if os.path.exists(raw_path):
+            try:
+                subprocess.run(
+                    ["ffmpeg", "-i", raw_path, "-q:a", "2", "-y", mp3_path],
+                    capture_output=True, timeout=120
+                )
+                os.remove(raw_path)
+                return mp3_path if os.path.exists(mp3_path) else None
+            except Exception:
+                return raw_path
+
+    else:
+        h = QUALITY_HEIGHT.get(quality, 360)
+        # formatStreams = combined video+audio (no merging needed)
+        combined = data.get("formatStreams", [])
+        # Pick closest quality
+        combined_sorted = sorted(
+            [f for f in combined if int(f.get("resolution", "0p").replace("p","") or 0) <= h],
+            key=lambda x: int(x.get("resolution", "0p").replace("p","") or 0),
+            reverse=True
+        )
+        if not combined_sorted:
+            combined_sorted = sorted(
+                combined,
+                key=lambda x: int(x.get("resolution", "0p").replace("p","") or 0)
+            )
+
+        if not combined_sorted:
+            return None
+
+        stream_url = combined_sorted[0]["url"]
+        mp4_path   = out_path + ".mp4"
+        _download_url(stream_url, mp4_path)
+        return mp4_path if os.path.exists(mp4_path) else None
+
+
+def _download_url(url: str, dest: str):
+    """Download a direct URL to a file."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Linux; Android 11) AppleWebKit/537.36",
+        "Referer":    "https://www.youtube.com/",
+    }
+    req = _req.Request(url, headers=headers)
+    with _req.urlopen(req, timeout=60) as r, open(dest, "wb") as f:
+        while True:
+            chunk = r.read(1024 * 256)
+            if not chunk:
+                break
+            f.write(chunk)
+
+
+# ── Public API ──────────────────────────────────────────────────
 
 def _fetch_info_sync(url: str) -> dict:
-    """Fetch video metadata without downloading."""
-    # Clean tracking params from URL
-    clean = url.split("?")[0] if "youtu.be" not in url else url.split("?")[0]
-    opts  = _base_opts(skip_download=True)
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        return ydl.extract_info(clean, download=False)
+    """Try yt-dlp first, fall back to Invidious."""
+    # Try yt-dlp
+    info = _ytdlp_info(url)
+    if info:
+        return info
+
+    # Fall back to Invidious
+    vid_id = _extract_video_id(url)
+    if not vid_id:
+        raise yt_dlp.utils.DownloadError("Could not extract video ID from URL")
+
+    data = _invidious_info(vid_id)
+    if not data:
+        raise yt_dlp.utils.DownloadError("All download methods failed. Try again later.")
+
+    # Normalise to yt-dlp-style dict
+    return {
+        "title":      data.get("title", "Unknown"),
+        "duration":   data.get("lengthSeconds", 0),
+        "view_count": data.get("viewCount", 0),
+        "uploader":   data.get("author", ""),
+        "_via":       "invidious",
+        "_vid_id":    vid_id,
+    }
 
 
 def _download_sync(url: str, quality: str) -> str | None:
-    """Download video/audio. Returns file path or None."""
-    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-    clean    = url.split("?")[0] if "youtu.be" not in url else url.split("?")[0]
-    template = f"{DOWNLOAD_DIR}/%(id)s_{quality}.%(ext)s"
-    opts     = _build_ydl_opts(quality, template)
+    """Try yt-dlp first, fall back to Invidious."""
+    # Strategy 1: yt-dlp
+    path = _ytdlp_download(url, quality)
+    if path and os.path.exists(path):
+        return path
 
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info     = ydl.extract_info(clean, download=True)
-        filename = ydl.prepare_filename(info)
-        base     = os.path.splitext(filename)[0]
+    # Strategy 2: Invidious
+    logger.info("yt-dlp failed, trying Invidious fallback…")
+    vid_id = _extract_video_id(url)
+    if vid_id:
+        path = _invidious_download(vid_id, quality)
+        if path and os.path.exists(path):
+            return path
 
-        for ext in (".mp4", ".mp3", ".webm", ".mkv", ".m4a"):
-            candidate = base + ext
-            if os.path.exists(candidate):
-                return candidate
-        if os.path.exists(filename):
-            return filename
     return None
 
 
@@ -314,7 +451,6 @@ async def fetch_info(url: str) -> dict:
 async def download_file(url: str, quality: str) -> str | None:
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, _download_sync, url, quality)
-
 
 # ══════════════════════════════════════════
 #  ADMIN DECORATOR
