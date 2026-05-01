@@ -201,27 +201,34 @@ async def check_fsub(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
 #  DOWNLOADER
 # ══════════════════════════════════════════
 
-def _build_ydl_opts(quality: str, out_template: str) -> dict:
-    """Build yt-dlp options based on quality choice."""
-    base = {
-        "outtmpl": out_template,
+def _base_opts() -> dict:
+    """
+    Base yt-dlp options that bypass YouTube VPS IP blocking WITHOUT cookies.
+
+    YouTube's Android & iOS app clients do NOT require a PO Token
+    (the anti-bot measure that blocks VPS IPs). By telling yt-dlp to
+    use the Android client first, downloads work on any VPS without cookies.
+    Fallback chain: android -> ios -> web
+    """
+    opts = {
         "quiet": True,
         "no_warnings": True,
         "retries": 5,
-        "http_headers": {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
-        },
-        # Helps bypass PO Token issues on VPS
         "extractor_args": {
-            "youtube": {"player_client": ["web"]}
+            "youtube": {
+                "player_client": ["android", "ios", "web"],
+            }
         },
     }
     if os.path.exists(COOKIES_FILE):
-        base["cookiefile"] = COOKIES_FILE
+        opts["cookiefile"] = COOKIES_FILE
+    return opts
+
+
+def _build_ydl_opts(quality: str, out_template: str) -> dict:
+    """Build yt-dlp options based on quality choice."""
+    base = _base_opts()
+    base["outtmpl"] = out_template
 
     if quality == "audio":
         base.update({
@@ -262,15 +269,8 @@ def _build_ydl_opts(quality: str, out_template: str) -> dict:
 
 def _fetch_info_sync(url: str) -> dict:
     """Fetch video metadata without downloading."""
-    opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-        "extractor_args": {"youtube": {"player_client": ["web"]}},
-    }
-    if os.path.exists(COOKIES_FILE):
-        opts["cookiefile"] = COOKIES_FILE
-
+    opts = _base_opts()
+    opts["skip_download"] = True
     with yt_dlp.YoutubeDL(opts) as ydl:
         return ydl.extract_info(url, download=False)
 
