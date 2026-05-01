@@ -201,25 +201,34 @@ async def check_fsub(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
 #  DOWNLOADER
 # ══════════════════════════════════════════
 
-def _base_opts() -> dict:
+def _base_opts(skip_download: bool = False) -> dict:
     """
-    Base yt-dlp options that bypass YouTube VPS IP blocking WITHOUT cookies.
+    Best cookieless bypass for YouTube on VPS (2025).
 
-    YouTube's Android & iOS app clients do NOT require a PO Token
-    (the anti-bot measure that blocks VPS IPs). By telling yt-dlp to
-    use the Android client first, downloads work on any VPS without cookies.
-    Fallback chain: android -> ios -> web
+    tv_embedded + android_vr = no PO Token required on any server IP.
+    These clients are for embedded/VR playback — YouTube doesn't
+    enforce bot-checks on them yet.
     """
     opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "retries": 5,
+        "quiet": False,         # Show errors in server log for debugging
+        "no_warnings": False,
+        "retries": 10,
+        "socket_timeout": 30,
+        "nocheckcertificate": True,
         "extractor_args": {
             "youtube": {
-                "player_client": ["android", "ios", "web"],
+                # tv_embedded and android_vr bypass PO Token on VPS
+                "player_client": ["tv_embedded", "android_vr", "android", "ios"],
+                "skip": ["translated_subs"],
             }
         },
+        "http_headers": {
+            "User-Agent": "com.google.android.youtube/19.09.37 (Linux; U; Android 11)",
+            "Accept-Language": "en-US,en;q=0.9",
+        },
     }
+    if skip_download:
+        opts["skip_download"] = True
     if os.path.exists(COOKIES_FILE):
         opts["cookiefile"] = COOKIES_FILE
     return opts
@@ -269,24 +278,25 @@ def _build_ydl_opts(quality: str, out_template: str) -> dict:
 
 def _fetch_info_sync(url: str) -> dict:
     """Fetch video metadata without downloading."""
-    opts = _base_opts()
-    opts["skip_download"] = True
+    # Clean tracking params from URL
+    clean = url.split("?")[0] if "youtu.be" not in url else url.split("?")[0]
+    opts  = _base_opts(skip_download=True)
     with yt_dlp.YoutubeDL(opts) as ydl:
-        return ydl.extract_info(url, download=False)
+        return ydl.extract_info(clean, download=False)
 
 
 def _download_sync(url: str, quality: str) -> str | None:
     """Download video/audio. Returns file path or None."""
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    clean    = url.split("?")[0] if "youtu.be" not in url else url.split("?")[0]
     template = f"{DOWNLOAD_DIR}/%(id)s_{quality}.%(ext)s"
     opts     = _build_ydl_opts(quality, template)
 
     with yt_dlp.YoutubeDL(opts) as ydl:
-        info     = ydl.extract_info(url, download=True)
+        info     = ydl.extract_info(clean, download=True)
         filename = ydl.prepare_filename(info)
         base     = os.path.splitext(filename)[0]
 
-        # Find the actual file (extension may differ)
         for ext in (".mp4", ".mp3", ".webm", ".mkv", ".m4a"):
             candidate = base + ext
             if os.path.exists(candidate):
